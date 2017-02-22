@@ -65,18 +65,10 @@ def get_filtered_photos_with_taxon(session, metadata, filter_):
     Taxon = Base.classes.taxa
     Rank = Base.classes.ranks
 
-    # Use a subquery because we want photos to be returned even if the don't
-    # have a taxa for the given class.
+    # Use a subquery because we want photos to be returned even if they don't
+    # have taxa for the given class.
     class_ = filter_.get('class')
-    stmt_genus = session.query(Photo.id, Taxon.name.label('genus')).\
-        join(Photo.taxa_collection, Taxon.ranks).\
-        filter(Rank.name == 'genus').subquery()
-    stmt_section = session.query(Photo.id, Taxon.name.label('section')).\
-        join(Photo.taxa_collection, Taxon.ranks).\
-        filter(Rank.name == 'section').subquery()
-    stmt_species = session.query(Photo.id, Taxon.name.label('species')).\
-        join(Photo.taxa_collection, Taxon.ranks).\
-        filter(Rank.name == 'species').subquery()
+    stmt_genus, stmt_section, stmt_species = get_subqueries(session, Photo, Taxon, Rank)
 
     # Construct the main query.
     q = session.query(Photo, class_).\
@@ -118,17 +110,8 @@ def get_photos_with_taxa(session, metadata):
     Taxon = Base.classes.taxa
     Rank = Base.classes.ranks
 
-    stmt_genus = session.query(Photo.id, Taxon.name.label('genus')).\
-        join(Photo.taxa_collection, Taxon.ranks).\
-        filter(Rank.name == 'genus').subquery()
-
-    stmt_section = session.query(Photo.id, Taxon.name.label('section')).\
-        join(Photo.taxa_collection, Taxon.ranks).\
-        filter(Rank.name == 'section').subquery()
-
-    stmt_species = session.query(Photo.id, Taxon.name.label('species')).\
-        join(Photo.taxa_collection, Taxon.ranks).\
-        filter(Rank.name == 'species').subquery()
+    # Make subqueries.
+    stmt_genus, stmt_section, stmt_species = get_subqueries(session, Photo, Taxon, Rank)
 
     q = session.query(Photo, 'genus', 'section', 'species').\
         join(stmt_genus, stmt_genus.c.id == Photo.id).\
@@ -161,17 +144,8 @@ def get_taxa_photo_count(session, metadata):
     Taxon = Base.classes.taxa
     Rank = Base.classes.ranks
 
-    stmt_genus = session.query(Photo.id, Taxon.name.label('genus')).\
-        join(Photo.taxa_collection, Taxon.ranks).\
-        filter(Rank.name == 'genus').subquery()
-
-    stmt_section = session.query(Photo.id, Taxon.name.label('section')).\
-        join(Photo.taxa_collection, Taxon.ranks).\
-        filter(Rank.name == 'section').subquery()
-
-    stmt_species = session.query(Photo.id, Taxon.name.label('species')).\
-        join(Photo.taxa_collection, Taxon.ranks).\
-        filter(Rank.name == 'species').subquery()
+    # Make subqueries.
+    stmt_genus, stmt_section, stmt_species = get_subqueries(session, Photo, Taxon, Rank)
 
     q = session.query('genus', 'section', 'species',
             functions.count(Photo.id).label('photos')).\
@@ -576,6 +550,21 @@ def set_default_ranks(session, metadata):
         session.add(rank)
 
     session.commit()
+    
+def get_subqueries(session, Photo, Taxon, Rank):
+    stmt_genus = session.query(Photo.id, Taxon.name.label('genus')).\
+        join(Photo.taxa_collection, Taxon.ranks).\
+        filter(Rank.name == 'genus').subquery()
+
+    stmt_section = session.query(Photo.id, Taxon.name.label('section')).\
+        join(Photo.taxa_collection, Taxon.ranks).\
+        filter(Rank.name == 'section').subquery()
+
+    stmt_species = session.query(Photo.id, Taxon.name.label('species')).\
+        join(Photo.taxa_collection, Taxon.ranks).\
+        filter(Rank.name == 'species').subquery()
+        
+    return stmt_genus, stmt_section, stmt_species
 
 
 class MakeMeta(object):
