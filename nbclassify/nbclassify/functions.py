@@ -320,6 +320,25 @@ def singleton(cls):
         return instances[cls]
     return get_instance
 
+def get_surf_features_from_phenotype(phenotype):
+    """Return the SURF features and their phenotype locations.
+
+    The phenotype contains all extracted features. The SURF
+    features must be extracted to compare them to the 
+    codebook and get the bowcode. The SURF features in the
+    phenotype can then be replaced by the bowcode. This function
+    returns the SURF features and their locations in the phenotype.
+    """
+    surf_feat = []
+    surf_locations = []
+    for featnr in range(len(phenotype)):
+        # Check if phenotype is created with SURF.
+        if phenotype[featnr].shape == (128,):
+            surf_locations.append(featnr)
+            surf_feat.append(phenotype[featnr])
+    return surf_feat, surf_locations
+    
+
 def get_bowcode_from_surf_features(surf_features, codebook):
     """Return the BagOfWords code of SURF features.
 

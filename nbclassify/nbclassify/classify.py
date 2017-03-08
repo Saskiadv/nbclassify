@@ -15,7 +15,7 @@ from .data import Phenotyper
 from .exceptions import *
 from .functions import (combined_hash, get_childs_from_hierarchy,
     get_classification, get_codewords, get_config_hashables,
-                        get_bowcode_from_surf_features)
+    get_surf_features_from_phenotype, get_bowcode_from_surf_features)
 
 class ImageClassifier(Common):
 
@@ -114,14 +114,20 @@ class ImageClassifier(Common):
             if use_bow:
                 with open(codebookfile, "rb") as cb:
                     codebook = load(cb)
-                phenotype = get_bowcode_from_surf_features(phenotype, codebook)
+                surf_feat, surf_locations = get_surf_features_from_phenotype(phenotype)
+                bowcode = get_bowcode_from_surf_features(surf_feat, codebook)
+
+                nw_phenotype = phenotype[:surf_locations[0]]
+                nw_phenotype.extend(bowcode)
+                nw_phenotype.extend(phenotype[surf_locations[-1]+1:])
+                phenotype = nw_phenotype
 
         logging.debug("Using ANN `%s`" % ann_path)
         codeword = ann.run(phenotype)
-
+     
         return codeword
 
-    def classify_with_hierarchy(self, image_path, ann_base_path=".",
+    def classify_with_hierarchy(self, image_path, ann_base_path=".", codebook_base_path=".", 
                                 path=[], path_error=[], codebookfile=None):
         """Start recursive classification.
 
@@ -181,6 +187,8 @@ class ImageClassifier(Common):
 
             # Classify the image and obtain the codeword.
             ann_path = os.path.join(ann_base_path, ann_file)
+            if not codebookfile and 'surf' in sorted(vars(conf.features).keys()):
+                codebookfile = codebook_base_path + ann_file.replace('ann', 'tsv_codebook.file')
             codeword = self.classify_image(image_path, ann_path,
                                            conf, codebookfile)
 
@@ -224,7 +232,8 @@ class ImageClassifier(Common):
         for class_, mse in zip(classes, class_errors):
             # Recurse into lower hierarchy levels.
             paths_, paths_errors_ = self.classify_with_hierarchy(image_path,
-                ann_base_path, path+[class_], path_error+[mse], codebookfile)
+                ann_base_path, codebook_base_path, path+[class_], 
+                path_error+[mse], codebookfile)
 
             # Keep a list of each classification path and their
             # corresponding errors.
