@@ -320,15 +320,15 @@ def singleton(cls):
         return instances[cls]
     return get_instance
 
-def get_surf_features_from_phenotype(phenotype):
-    """Return the SURF features and their phenotype locations.
+def get_phenotype_with_bowcode(phenotype, codebook):
+    """Return the phenotype with bowcode instead of SURF features.
 
-    The phenotype contains all extracted features. The SURF
-    features must be extracted to compare them to the 
-    codebook and get the bowcode. The SURF features in the
-    phenotype can then be replaced by the bowcode. This function
-    returns the SURF features and their locations in the phenotype.
-    """
+    The phenotype contains all extracted features. The SURF 
+    features must be extracted to compare them to the codebook 
+    and get the bowcode. The SURF features in the phenotype can
+    then be replaced by the bowcode. This function returns the
+    new phenotype where the SURF features are replaced by their
+    bowcode."""
     surf_feat = []
     surf_locations = []
     for featnr in range(len(phenotype)):
@@ -336,8 +336,11 @@ def get_surf_features_from_phenotype(phenotype):
         if phenotype[featnr].shape == (128,):
             surf_locations.append(featnr)
             surf_feat.append(phenotype[featnr])
-    return surf_feat, surf_locations
-    
+    bowcode = get_bowcode_from_surf_features(surf_feat, codebook)
+    nw_phenotype = phenotype[:surf_locations[0]]
+    nw_phenotype.extend(bowcode)
+    nw_phenotype.extend(phenotype[surf_locations[-1]+1:])
+    return nw_phenotype
 
 def get_bowcode_from_surf_features(surf_features, codebook):
     """Return the BagOfWords code of SURF features.
@@ -351,6 +354,10 @@ def get_bowcode_from_surf_features(surf_features, codebook):
         code, bins=range(codebook.shape[0] + 1), normed=True)
     return list(word_hist)
 
+def check_if_file_exists(file_path):
+    """Check if file exists."""
+    if not os.path.isfile(file_path):
+        raise IOError("Cannot open %s (no such file)" % file_path)
 
 class Struct(Namespace):
 

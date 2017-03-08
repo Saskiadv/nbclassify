@@ -15,7 +15,8 @@ from .data import Phenotyper
 from .exceptions import *
 from .functions import (combined_hash, get_childs_from_hierarchy,
     get_classification, get_codewords, get_config_hashables,
-    get_surf_features_from_phenotype, get_bowcode_from_surf_features)
+    get_phenotype_with_bowcode, get_bowcode_from_surf_features, 
+    check_if_file_exists)
 
 class ImageClassifier(Common):
 
@@ -67,16 +68,13 @@ class ImageClassifier(Common):
         for the neural network `ann_path` to obtain a codeword.
         If necessary the 'codebookfile' is used to create the codeword.
         """
-        if not os.path.isfile(im_path):
-            raise IOError("Cannot open %s (no such file)" % im_path)
-        if not os.path.isfile(ann_path):
-            raise IOError("Cannot open %s (no such file)" % ann_path)
+        for filename in [im_path, ann_path, codebookfile]:
+            if filename != None:
+                check_if_file_exists(filename)
         if 'preprocess' not in config:
             raise ConfigurationError("preprocess settings not set")
         if 'features' not in config:
             raise ConfigurationError("features settings not set")
-        if codebookfile and not os.path.isfile(codebookfile):
-            raise IOError("Cannot open %s (no such file)" % codebookfile)
 
         ann = libfann.neural_net()
         ann.create_from_file(str(ann_path))
@@ -106,29 +104,20 @@ class ImageClassifier(Common):
             # Cache the phenotypes, in case they are needed again.
             self.cache[hash_] = phenotype
 
-            # Convert phenotype to BagOfWords-code if necessary.
-            use_bow = False
-            for name in sorted(vars(config.features).keys()):
-                if name == 'surf':
-                    use_bow = True
-            if use_bow:
+        # If the SURF algorithm is applied, convert SURF features to BagOfWords-code.
+        for name in sorted(vars(config.features).keys()):
+            if name == 'surf':
                 with open(codebookfile, "rb") as cb:
                     codebook = load(cb)
-                surf_feat, surf_locations = get_surf_features_from_phenotype(phenotype)
-                bowcode = get_bowcode_from_surf_features(surf_feat, codebook)
-
-                nw_phenotype = phenotype[:surf_locations[0]]
-                nw_phenotype.extend(bowcode)
-                nw_phenotype.extend(phenotype[surf_locations[-1]+1:])
-                phenotype = nw_phenotype
+                phenotype = get_phenotype_with_bowcode(phenotype, codebook)
 
         logging.debug("Using ANN `%s`" % ann_path)
         codeword = ann.run(phenotype)
-     
         return codeword
 
-    def classify_with_hierarchy(self, image_path, ann_base_path=".", codebook_base_path=".", 
-                                path=[], path_error=[], codebookfile=None):
+    def classify_with_hierarchy(self, image_path, ann_base_path=".", 
+                                codebook_base_path=".", path=[], path_error=[], 
+                                codebookfile=None):
         """Start recursive classification.
 
         Classify the image `image_path` with neural networks from the
@@ -173,40 +162,64 @@ class ImageClassifier(Common):
         if level_classes == [None] and level.name in ('genus','species'):
             raise ValueError("Classes for level `%s` are not set" % level.name)
 
-        if level_classes == [None]:
-            # No need to classify if there are no classes for current level.
-            classes = level_classes
-            class_errors = [0.0]
-        elif len(level_classes) == 1:
-            # Also no need to classify if there is only one class.
+        # No need to classify if there are no or only one class for current level.
+        if level_classes == [None] or len(level_classes) == 1:
             classes = level_classes
             class_errors = [0.0]
         else:
-            # Get the codewords for the classes.
-            class_codewords = get_codewords(level_classes)
+            class_errors, classes = self.get_classes_and_errors(level_classes,
+                 ann_base_path, ann_file, level, codebookfile, codebook_base_path,
+                 image_path, conf)
 
-            # Classify the image and obtain the codeword.
-            ann_path = os.path.join(ann_base_path, ann_file)
-            if not codebookfile and 'surf' in sorted(vars(conf.features).keys()):
-                codebookfile = codebook_base_path + ann_file.replace('ann', 'tsv_codebook.file')
-            codeword = self.classify_image(image_path, ann_path,
-                                           conf, codebookfile)
+        failed = create_info_messages(path, classes, level)
+        if failed:
+            return failed
 
-            # Set the maximum classification error for this level.
-            try:
-                max_error = level.max_error
-            except:
-                max_error = self.error
+        for class_, mse in zip(classes, class_errors):
+            # Recurse into lower hierarchy levels.
+            paths_, paths_errors_ = self.classify_with_hierarchy(image_path,
+                ann_base_path, codebook_base_path, path+[class_], 
+                path_error+[mse], codebookfile)
 
-            # Get the class name associated with this codeword.
-            classes = get_classification(class_codewords,
-                codeword, max_error)
-            if classes:
-                class_errors, classes = zip(*classes)
-            else:
-                class_errors = classes = []
+            # Keep a list of each classification path and their
+            # corresponding errors.
+            paths.extend(paths_)
+            paths_errors.extend(paths_errors_)
 
-        # Print some info messages.
+        assert len(paths) == len(paths_errors), \
+            "Number of paths must be equal to the number of path errors"
+        return paths, paths_errors
+
+
+    def get_classes_and_errors(level_classes, ann_base_path, ann_file, level,
+                               codebookfile, codebook_base_path, image_path, conf)
+        """Return the classes with their errors."""
+        # Get the codewords for the classes.
+        class_codewords = get_codewords(level_classes)
+
+        # Classify the image and obtain the codeword.
+        ann_path = os.path.join(ann_base_path, ann_file)
+        if not codebookfile and 'surf' in sorted(vars(conf.features).keys()):
+            codebookfile = codebook_base_path + ann_file.replace('ann',
+                                                    'tsv_codebook.file')
+        codeword = self.classify_image(image_path, ann_path, conf, codebookfile)
+
+        # Set the maximum classification error for this level.
+        try:
+            max_error = level.max_error
+        except:
+            max_error = self.error
+
+        # Get the class name associated with this codeword.
+        classes = get_classification(class_codewords, codeword, max_error)
+        if classes:
+            class_errors, classes = zip(*classes)
+        else:
+            class_errors = classes = []
+        return class_errors, classes
+
+    def create_info_messages(path, classes, level):
+        """Print some info messages."""
         path_s = '/'.join([str(p) for p in path])
 
         # Return the classification if classification failed on current level.
@@ -229,18 +242,3 @@ class ImageClassifier(Common):
                 classes[0])
             )
 
-        for class_, mse in zip(classes, class_errors):
-            # Recurse into lower hierarchy levels.
-            paths_, paths_errors_ = self.classify_with_hierarchy(image_path,
-                ann_base_path, codebook_base_path, path+[class_], 
-                path_error+[mse], codebookfile)
-
-            # Keep a list of each classification path and their
-            # corresponding errors.
-            paths.extend(paths_)
-            paths_errors.extend(paths_errors_)
-
-        assert len(paths) == len(paths_errors), \
-            "Number of paths must be equal to the number of path errors"
-
-        return paths, paths_errors
