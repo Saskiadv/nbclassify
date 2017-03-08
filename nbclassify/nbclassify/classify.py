@@ -79,30 +79,7 @@ class ImageClassifier(Common):
         ann = libfann.neural_net()
         ann.create_from_file(str(ann_path))
 
-        # Get the MD5 hash for the image.
-        hasher = hashlib.md5()
-        with open(im_path, 'rb') as fh:
-            buf = fh.read()
-            hasher.update(buf)
-
-        # Get a hash that that is unique for this image/preprocess/features
-        # combination.
-        hashables = get_config_hashables(config)
-        hash_ = combined_hash(hasher.hexdigest(),
-            config.features, *hashables)
-
-        if hash_ in self.cache:
-            phenotype = self.cache[hash_]
-        else:
-            phenotyper = Phenotyper()
-            phenotyper.set_image(im_path)
-            if self.roi:
-                phenotyper.set_roi(self.roi)
-            phenotyper.set_config(config)
-            phenotype = phenotyper.make()
-
-            # Cache the phenotypes, in case they are needed again.
-            self.cache[hash_] = phenotype
+        phenotype = self.get_phenotype(im_path, config)
 
         # If the SURF algorithm is applied, convert SURF features to BagOfWords-code.
         for name in sorted(vars(config.features).keys()):
@@ -155,23 +132,11 @@ class ImageClassifier(Common):
             val = val if val is not None else '_'
             ann_file = ann_file.replace("__%s__" % key, val)
 
-        # Get the class names for this node in the taxonomic hierarchy.
-        level_classes = get_childs_from_hierarchy(self.taxon_hr, path)
+        class_errors, classes = self.get_levels_and_classes(path, level, 
+                                 ann_base_path, ann_file, codebookfile, 
+                                 codebook_base_path, image_path, conf)
 
-        # Some levels must have classes set.
-        if level_classes == [None] and level.name in ('genus','species'):
-            raise ValueError("Classes for level `%s` are not set" % level.name)
-
-        # No need to classify if there are no or only one class for current level.
-        if level_classes == [None] or len(level_classes) == 1:
-            classes = level_classes
-            class_errors = [0.0]
-        else:
-            class_errors, classes = self.get_classes_and_errors(level_classes,
-                 ann_base_path, ann_file, level, codebookfile, codebook_base_path,
-                 image_path, conf)
-
-        failed = create_info_messages(path, classes, level)
+        failed = self.create_info_messages(path, classes, level)
         if failed:
             return failed
 
@@ -191,9 +156,35 @@ class ImageClassifier(Common):
         return paths, paths_errors
 
 
-    def get_classes_and_errors(level_classes, ann_base_path, ann_file, level,
-                               codebookfile, codebook_base_path, image_path, conf)
-        """Return the classes with their errors."""
+    def get_levels_and_classes(self, path, level, ann_base_path, ann_file,
+                               codebookfile, codebook_base_path, image_path,
+                               conf):
+        """Return the classes with their errors.
+       
+        Check if there are multiple classes for this level and
+        return the classification for those classes with their mse.
+        """
+        # Get the class names for this node in the taxonomic hierarchy.
+        level_classes = get_childs_from_hierarchy(self.taxon_hr, path)
+
+        # Some levels must have classes set.
+        if level_classes == [None] and level.name in ('genus','species'):
+            raise ValueError("Classes for level `%s` are not set" % level.name)
+
+        # No need to classify if there are no or only one class for current level.
+        if level_classes == [None] or len(level_classes) == 1:
+            classes = level_classes
+            class_errors = [0.0]
+        else:
+            class_errors, classes = self.get_classes_and_errors(level_classes,
+                 ann_base_path, ann_file, level, codebookfile, codebook_base_path,
+                 image_path, conf)
+        return class_errors, classes
+
+    def get_classes_and_errors(self, level_classes, ann_base_path, ann_file, 
+                               level, codebookfile, codebook_base_path, 
+                               image_path, conf):
+        """Return the classes with their errors to self.get_levels_and_classes."""
         # Get the codewords for the classes.
         class_codewords = get_codewords(level_classes)
 
@@ -218,7 +209,7 @@ class ImageClassifier(Common):
             class_errors = classes = []
         return class_errors, classes
 
-    def create_info_messages(path, classes, level):
+    def create_info_messages(self, path, classes, level):
         """Print some info messages."""
         path_s = '/'.join([str(p) for p in path])
 
@@ -241,4 +232,32 @@ class ImageClassifier(Common):
                 path_s,
                 classes[0])
             )
+
+    def get_phenotype(self, im_path, config):
+        """Return the phenotype of an image."""
+        # Get the MD5 hash for the image.
+        hasher = hashlib.md5()
+        with open(im_path, 'rb') as fh:
+            buf = fh.read()
+            hasher.update(buf)
+
+        # Get a hash that that is unique for this image/preprocess/features
+        # combination.
+        hashables = get_config_hashables(config)
+        hash_ = combined_hash(hasher.hexdigest(),
+            config.features, *hashables)
+
+        if hash_ in self.cache:
+            phenotype = self.cache[hash_]
+        else:
+            phenotyper = Phenotyper()
+            phenotyper.set_image(im_path)
+            if self.roi:
+                phenotyper.set_roi(self.roi)
+            phenotyper.set_config(config)
+            phenotype = phenotyper.make()
+
+            # Cache the phenotypes, in case they are needed again.
+            self.cache[hash_] = phenotype
+        return phenotype
 
