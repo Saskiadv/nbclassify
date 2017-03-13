@@ -134,15 +134,13 @@ class PhenotypeCache(object):
         these features and combined them to phenotypes.
         """
         session, metadata = db.get_session_or_error()
-
         phenotyper = Phenotyper()
 
         # Get a list of all the photos in the database.
         photos = db.get_photos(session, metadata)
 
-        # Cache each feature for each photo separately. One cache per
-        # feature type is created, and each cache contains the features
-        # for all images.
+        # Cache each feature for each photo separately. One cache per feature
+        # type is created, and each cache contains the features for all images.
         for hash_, c in self.get_single_feature_configurations(config):
             if not os.path.isdir(cache_dir):
                 os.makedirs(cache_dir)
@@ -342,9 +340,38 @@ class Phenotyper(object):
         if 'preprocess' not in self.config:
             return
 
-        # Scale the image down if its perimeter (width+height) exceeds the
-        # maximum. If a ROI is set, use the perimeter of the ROI instead, or
-        # else we might end up with a very small ROI.
+        # Perform resizing.
+        self.__preprocess_resize()
+
+        # Perform color correction.
+        self.__preprocess_color()
+
+        # Perform segmentation.
+        try:
+            segmentation = self.config.preprocess.segmentation.grabcut
+        except:
+            segmentation = {}
+
+        if segmentation:
+            logging.info("Segmenting...")
+            self.__preprocess_segment(segmentation)
+        else:
+            # Crop image in stead of segmenting.
+            try:
+                crop = self.config.preprocess.crop
+            except:
+                crop = {}
+
+            if crop:
+                logging.info("Cropping image...")
+                self.__preprocess_crop(crop)
+
+    def __preprocess_resize(self):
+        """Resize the image if needed.
+
+        Scale the image down if its perimeter (width+height) exceeds the
+        maximum. If a ROI is set, use the perimeter of the ROI instead, or
+        else we might end up with a very small ROI."""
         if self.roi:
             perim = sum(self.roi[2:4])
         else:
@@ -362,9 +389,10 @@ class Phenotyper(object):
             self.roi = [int(x*rf) for x in self.roi]
             self.roi = tuple(self.roi)
 
-        # Perform color enhancement.
-        color_enhancement = getattr(self.config.preprocess,
-            'color_enhancement', None)
+    def __preprocess_color(self):
+        """Perform color enhancement."""
+        color_enhancement = getattr(self.config.preprocess, 
+                                    'color_enhancement', None)
         if color_enhancement:
             for method, args in vars(color_enhancement).iteritems():
                 if method == 'naik_murthy_linear':
@@ -374,95 +402,81 @@ class Phenotyper(object):
                     raise ConfigurationError("Unknown color enhancement "\
                         "method '%s'" % method)
 
-        # Perform segmentation.
-        try:
-            segmentation = self.config.preprocess.segmentation.grabcut
-        except:
-            segmentation = {}
+    def __preprocess_segment(self, segmentation):
+        """Segment image to desired contour."""
+        iters = getattr(segmentation, 'iters', 5)
+        margin = getattr(segmentation, 'margin', 1)
+        output_folder = getattr(segmentation, 'output_folder', None)
 
-        if segmentation:
-            logging.info("Segmenting...")
-            iters = getattr(segmentation, 'iters', 5)
-            margin = getattr(segmentation, 'margin', 1)
-            output_folder = getattr(segmentation, 'output_folder', None)
+        # Get the main contour.
+        self.mask = self.__grabcut(self.img, iters, self.roi, margin)
+        self.bin_mask = np.where((self.mask==cv2.GC_FGD) + \
+            (self.mask==cv2.GC_PR_FGD), 255, 0).astype('uint8')
+        contour = ft.get_largest_contour(self.bin_mask, cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE)
+        if contour is None:
+            raise ValueError("No contour found for binary image")
 
-            # Get the main contour.
-            self.mask = self.__grabcut(self.img, iters, self.roi, margin)
-            self.bin_mask = np.where((self.mask==cv2.GC_FGD) + \
-                (self.mask==cv2.GC_PR_FGD), 255, 0).astype('uint8')
-            contour = ft.get_largest_contour(self.bin_mask, cv2.RETR_EXTERNAL,
-                cv2.CHAIN_APPROX_SIMPLE)
-            if contour is None:
-                raise ValueError("No contour found for binary image")
+        # Create a binary mask of the main contour.
+        self.bin_mask = np.zeros(self.img.shape[:2], dtype=np.uint8)
+        cv2.drawContours(self.bin_mask, [contour], 0, 255, -1)
 
-            # Create a binary mask of the main contour.
-            self.bin_mask = np.zeros(self.img.shape[:2], dtype=np.uint8)
-            cv2.drawContours(self.bin_mask, [contour], 0, 255, -1)
+        # Save the masked image to the output folder.
+        if output_folder:
+            img_masked = cv2.bitwise_and(self.img, self.img, mask=self.bin_mask)
 
-            # Save the masked image to the output folder.
-            if output_folder:
-                img_masked = cv2.bitwise_and(self.img, self.img,
-                    mask=self.bin_mask)
+            out_path = os.path.join(output_folder, self.path)
+            out_dir = os.path.dirname(out_path)
+            if not os.path.isdir(out_dir):
+                os.makedirs(out_dir)
 
-                out_path = os.path.join(output_folder, self.path)
-                out_dir = os.path.dirname(out_path)
-                if not os.path.isdir(out_dir):
-                    os.makedirs(out_dir)
+            cv2.imwrite(out_path, img_masked)
 
-                cv2.imwrite(out_path, img_masked)
+    def __preprocess_crop(self, crop):
+        """Crop image to desired region of interest (ROI).
+ 
+        A ROI can be described in pixel units or in fractions of total image
+        size. If no (valid) ROI is described, the whole image will be used."""
+        roi_pix = getattr(crop, 'roi_pix', None)
+        roi_frac = getattr(crop, 'roi_frac', None)
+        if roi_pix:
+            # roi_pix is like (x, y, w, h) in pixel units.
+            if len(roi_pix) != 4:
+                raise ValueError("roi_pix must be a list of four integers.")
+            for x in roi_pix:
+                if not (isinstance(x, int) and x >= 0):
+                    raise ValueError("roi_pix must be a (x, y, w, h) tuple "
+                                     "of integers.")
+            self.roi = roi_pix
+        elif roi_frac:
+            self.__preprocess_crop_roi_frac(roi_frac)
         else:
-            # Crop image in stead of segmenting.
-            try:
-                crop = self.config.preprocess.crop
-            except:
-                crop = {}
+            logging.warning("No ROI for cropping found. Proceed without cropping.")
+            self.roi = (0, 0, self.img.shape[1], self.img.shape[0])
 
-            if crop:
-                logging.info("Cropping image...")
-                roi_pix = getattr(crop, 'roi_pix', None)
-                roi_frac = getattr(crop, 'roi_frac', None)
-                if roi_pix:
-                    # roi_pix is like (x, y, w, h) in pixel units.
-                    if len(roi_pix) != 4:
-                        raise ValueError(
-                            "roi_pix must be a list of four integers.")
-                    for x in roi_pix:
-                        if not (isinstance(x, int) and x >= 0):
-                            raise ValueError(
-                                "roi_pix must be a (x, y, w, h) tuple "
-                                "of integers.")
-                    self.roi = roi_pix
-                elif roi_frac:
-                    # roi_frac is like (x1, x2, y1, y2) in fractions
-                    # of total img size.
-                    if len(roi_frac) != 4:
-                        raise ValueError(
-                            "roi_frac must be a list of four floats.")
-                    for x in roi_frac:
-                        if not 0 <= x <= 1:
-                            raise ValueError(
-                                "roi_frac must be a (x1, x2, y1, y2) tuple, "
-                                "where the values are floats between 0 and 1.")
-                    if not (roi_frac[0] < roi_frac[1] and
-                            roi_frac[2] < roi_frac[3]):
-                        raise ValueError(
-                            "roi_frac must be a (x1, x2, y1, y2) tuple, "
-                            "where x1 < x2 and y1 < y2.")
-                    # Make ROI like (x, y, w, h).
-                    self.roi = (int(self.img.shape[1] * roi_frac[0]),
-                                int(self.img.shape[0] * roi_frac[2]),
-                                int(self.img.shape[1] * roi_frac[1]) -
-                                int(self.img.shape[1] * roi_frac[0]),
-                                int(self.img.shape[0] * roi_frac[3]) -
-                                int(self.img.shape[0] * roi_frac[2]))
-                else:
-                    logging.warning("No ROI for cropping found. Proceed "
-                                    "without cropping.")
-                    self.roi = (0, 0, self.img.shape[1], self.img.shape[0])
+         # Crop image to given ROI.
+        self.img = self.img[self.roi[1]: self.roi[1] + self.roi[3],
+                            self.roi[0]: self.roi[0] + self.roi[2]]
 
-                # Crop image to given ROI.
-                self.img = self.img[self.roi[1]: self.roi[1] + self.roi[3],
-                                    self.roi[0]: self.roi[0] + self.roi[2]]
+    def __preprocess_crop_roi_frac(self, roi_frac):
+        """Set the ROI when given in fractions of total image size."""
+        # roi_frac is like (x1, x2, y1, y2) in fractions of total img size.
+        if len(roi_frac) != 4:
+            raise ValueError("roi_frac must be a list of four floats.")
+        for x in roi_frac:
+            if not 0 <= x <= 1:
+                raise ValueError("roi_frac must be a (x1, x2, y1, y2) tuple, "
+                                 "where the values are floats between 0 and 1.")
+        if not (roi_frac[0] < roi_frac[1] and roi_frac[2] < roi_frac[3]):
+            raise ValueError("roi_frac must be a (x1, x2, y1, y2) tuple, "
+                             "where x1 < x2 and y1 < y2.")
+        # Make ROI like (x, y, w, h).
+        self.roi = (int(self.img.shape[1] * roi_frac[0]), 
+                    int(self.img.shape[0] * roi_frac[2]),
+                    int(self.img.shape[1] * roi_frac[1]) -
+                    int(self.img.shape[1] * roi_frac[0]),
+                    int(self.img.shape[0] * roi_frac[3]) -
+                    int(self.img.shape[0] * roi_frac[2]))
 
     def make(self):
         """Return the phenotype for the loaded image.
@@ -489,30 +503,26 @@ class Phenotyper(object):
             if name == 'color_histograms':
                 logging.info("- Running color:histograms...")
                 data = self.__get_color_histograms(self.img, args, self.bin_mask)
-                phenotype.extend(data)
 
             elif name == 'color_bgr_means':
                 logging.info("- Running color:bgr_means...")
                 data = self.__get_color_bgr_means(self.img, args, self.bin_mask)
-                phenotype.extend(data)
 
             elif name == 'shape_outline':
                 logging.info("- Running shape:outline...")
                 data = self.__get_shape_outline(args, self.bin_mask)
-                phenotype.extend(data)
 
             elif name == 'shape_360':
                 logging.info("- Running shape:360...")
                 data = self.__get_shape_360(args, self.bin_mask)
-                phenotype.extend(data)
 
             elif name == 'surf':
                 logging.info("- Running feature:surf...")
                 data = self.__get_surf_features(args, self.img)
-                phenotype.extend(data)
 
             else:
                 raise ValueError("Unknown feature `%s`" % name)
+            phenotype.extend(data)
 
         return phenotype
 
@@ -617,6 +627,31 @@ class Phenotyper(object):
         t = getattr(args, 't', 8)
         output_functions = getattr(args, 'output_functions', {'mean_sd': True})
 
+        contour, rotation = self.__shape360_get_countour_set_rotation(bin_mask, 
+                                                                      rotation)
+        # Extract shape feature.
+        intersects, center = ft.shape_360(contour, rotation, step, t)
+
+        # Create a masked image.
+        if 'color_histograms' in output_functions:
+            img_masked = cv2.bitwise_and(self.img, self.img, mask=bin_mask)
+
+        # Run the output function for each angle.
+        means, sds, histograms = self.__shape360_output_per_angle(step, 
+                                 output_functions, center, image_masked)
+
+        # Normalize the features if a scaler is set.
+        if self.scaler and 'mean_sd' in output_functions:
+            means = self.scaler.fit_transform(means)
+            sds = self.scaler.fit_transform(sds)
+
+        # Group the means+sds together.
+        means_sds = np.array(zip(means, sds)).flatten()
+
+        return np.append(means_sds, histograms)
+
+    def __shape360_get_contour_set_rotation(self, bin_mask, rotation):
+        """Get contour and set rotation for :meth:`features.shape360`."""
         # Get the largest contour from the binary mask.
         contour = ft.get_largest_contour(bin_mask, cv2.RETR_EXTERNAL,
             cv2.CHAIN_APPROX_NONE)
@@ -630,15 +665,10 @@ class Phenotyper(object):
         if not 0 <= rotation <= 179:
             raise ValueError("Rotation must be in the range 0 to 179, "\
                 "found %s" % rotation)
+        return contour, rotation
 
-        # Extract shape feature.
-        intersects, center = ft.shape_360(contour, rotation, step, t)
-
-        # Create a masked image.
-        if 'color_histograms' in output_functions:
-            img_masked = cv2.bitwise_and(self.img, self.img, mask=bin_mask)
-
-        # Run the output function for each angle.
+    def __shape360_output_per_angle(self, step, output_functions, center, img_masked):
+        """Run the output function per angle for :meth:`features.shape360`."""
         means = []
         sds = []
         histograms = []
@@ -646,54 +676,54 @@ class Phenotyper(object):
             for f_name, f_args in vars(output_functions).iteritems():
                 # Mean distance + standard deviation.
                 if f_name == 'mean_sd':
-                    distances = []
-                    for p in intersects[angle]:
-                        d = ft.point_dist(center, p)
-                        distances.append(d)
-
-                    if len(distances) == 0:
-                        mean = 0
-                        sd = 0
-                    else:
-                        mean = np.mean(distances, dtype=np.float32)
-                        if len(distances) > 1:
-                            sd = np.std(distances, ddof=1, dtype=np.float32)
-                        else:
-                            sd = 0
-
+                    mean, sd = self.__shape360_output_mean_sd(angle, center)
                     means.append(mean)
                     sds.append(sd)
 
                 # Color histograms.
                 if f_name == 'color_histograms':
-                    # Get a line from the center to the outer intersection point.
-                    line = None
-                    if intersects[angle]:
-                        line = ft.extreme_points([center] + intersects[angle])
-
-                    # Create a mask for the line, where the line is foreground.
-                    line_mask = np.zeros(self.img.shape[:2], dtype=np.uint8)
-                    if line is not None:
-                        cv2.line(line_mask, tuple(line[0]), tuple(line[1]),
-                            255, 1)
-
-                    # Create histogram from masked + line masked image.
-                    hists = self.__get_color_histograms(img_masked, f_args,
-                        line_mask)
+                    hists = self.__shape360_output_color_hist(angle, center, 
+                                                          img_masked, f_args)
                     histograms.append(hists)
 
         means = means.astype(float)
         sds = sds.astype(float)
+        return means, sds, histograms
 
-        # Normalize the features if a scaler is set.
-        if self.scaler and 'mean_sd' in output_functions:
-            means = self.scaler.fit_transform(means)
-            sds = self.scaler.fit_transform(sds)
+    def __shape360_output_mean_sd(self, angle, center):
+        """Return mean distance and standard deviation for one angle
+           of :meth:`features.shape360`."""
+        distances = []
+        for p in intersects[angle]:
+            d = ft.point_dist(center, p)
+            distances.append(d)
 
-        # Group the means+sds together.
-        means_sds = np.array(zip(means, sds)).flatten()
+        if len(distances) == 0:
+            mean = 0
+            sd = 0
+        else:
+            mean = np.mean(distances, dtype=np.float32)
+            if len(distances) > 1:
+                sd = np.std(distances, ddof=1, dtype=np.float32)
+            else:
+                sd = 0
+        return mean, sd
 
-        return np.append(means_sds, histograms)
+    def __shape360_output_color_hist(self, angle, center, img_masked, f_args):
+        """Return image histogram for :meth:`features.shape360`."""
+        # Get a line from the center to the outer intersection point.
+        line = None
+        if intersects[angle]:
+            line = ft.extreme_points([center] + intersects[angle])
+
+        # Create a mask for the line, where the line is foreground.
+        line_mask = np.zeros(self.img.shape[:2], dtype=np.uint8)
+        if line is not None:
+            cv2.line(line_mask, tuple(line[0]), tuple(line[1]), 255, 1)
+
+        # Create histogram from masked + line masked image.
+        hists = self.__get_color_histograms(img_masked, f_args, line_mask)
+        return hists
 
     def __get_surf_features(self, args, src):
         """Executes :meth:`features.surf`."""
@@ -776,29 +806,9 @@ class TrainData(object):
             reader = csv.reader(fh, delimiter="\t")
 
             # Figure out the format of the data.
-            self.num_input = 0
-            self.num_output = 0
-            input_start = None
-            output_start = None
-            label_idx = None
             header = reader.next()
-            for i, field in enumerate(header):
-                if field == "ID":
-                    label_idx = i
-                elif field.startswith(dependent_prefix):
-                    if output_start == None:
-                        output_start = i
-                    self.num_output += 1
-                else:
-                    if input_start == None:
-                        input_start = i
-                    self.num_input += 1
-
-            if not self.num_input > 0:
-                raise ValueError("No input columns found in training data")
-            if not self.num_output > 0:
-                raise ValueError("Training data needs at least 1 output " \
-                    "columns, found %d" % self.num_output)
+            input_start, output_start, label_idx = self.__read_from_file_get_format(
+                                                   header, dependent_prefix)
 
             input_end = input_start + self.num_input
             output_end = output_start + self.num_output
@@ -812,6 +822,33 @@ class TrainData(object):
                 self.output.append(row[output_start:output_end])
 
             self.finalize()
+
+    def __read_from_file_get_format(self, header, dependent_prefix):
+        """Return index of input, output and ID column in 'header'."""
+        self.num_input = 0
+        self.num_output = 0
+        input_start = None
+        output_start = None
+        label_idx = None
+        for i, field in enumerate(header):
+            if field == "ID":
+                label_idx = i
+            elif field.startswith(dependent_prefix):
+                if output_start == None:
+                    output_start = i
+                self.num_output += 1
+            else:
+                if input_start == None:
+                    input_start = i
+                self.num_input += 1
+
+        if not self.num_input > 0:
+            raise ValueError("No input columns found in training data")
+        if not self.num_output > 0:
+            raise ValueError("Training data needs at least 1 output " \
+                "columns, found %d" % self.num_output)
+    
+        return input_start, output_start, label_idx, reader
 
     def __len__(self):
         return len(self.input)
@@ -1258,27 +1295,14 @@ class BatchMakeTrainData(MakeTrainData):
         # Make training data for each path in the classification hierarchy.
         for filter_ in classification_hierarchy_filters(levels, self.taxon_hr):
             level = levels.index(filter_.get('class'))
-            train_file = os.path.join(target_dir,
+            train_file = os.path.join(target_dir, 
                 self.class_hr[level].train_file)
                     
             config = self.class_hr[level]
-            
-            # Check if a codebook directory is given with existing codebook.
-            codebook_file = ""
-            if codebook_dir:
-                codebook_file = os.path.join(codebook_dir, 
-                    self.class_hr[level].train_file)
 
-            # Replace any placeholders in the paths.
-            where = filter_.get('where', {})
-            for key, val in where.items():
-                val = val if val is not None else '_'
-                train_file = train_file.replace("__%s__" % key, val)
-                codebook_file = codebook_file.replace("__%s__" % key, val)
-            
-            codebook_file = codebook_file + "_codebook.file"
-            if not os.path.isfile(codebook_file):
-                codebook_file = None
+            # Get codebook- and training data filenames for this batch.
+            codebook_file, train_file = self.__batch_export_get_codebook_filename(
+                codebook_dir, level, train_file, filter_)            
 
             # Generate and export the training data.
             logging.info("Exporting train data for classification on %s" % \
@@ -1288,3 +1312,24 @@ class BatchMakeTrainData(MakeTrainData):
             except FileExistsError as e:
                 # Don't export if the file already exists.
                 logging.warning("Skipping: %s" % e)
+
+    def __batch_export_get_codebook_filename(self, codebook_dir, level, train_file, filter_):
+        """Return codebook- and training data filenames for batch export."""
+        # Check if a codebook directory is given with existing codebook.
+        codebook_file = ""
+        if codebook_dir:
+            codebook_file = os.path.join(codebook_dir, self.class_hr[level].train_file)
+
+        # Replace any placeholders in the paths.
+        where = filter_.get('where', {})
+        for key, val in where.items():
+            val = val if val is not None else '_'
+            train_file = train_file.replace("__%s__" % key, val)
+            codebook_file = codebook_file.replace("__%s__" % key, val)
+            
+        codebook_file = codebook_file + "_codebook.file"
+        if not os.path.isfile(codebook_file):
+            codebook_file = None
+
+        return codebook_file, train_file
+
