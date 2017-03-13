@@ -22,7 +22,7 @@ from .base import Common, Struct
 from .exceptions import *
 from .functions import (combined_hash, classification_hierarchy_filters,
     get_codewords, get_config_hashables, readable_filter,
-    get_bowcode_from_surf_features)
+    get_phenotype_with_bowcode)
 import nbclassify.db as db
 
 class PhenotypeCache(object):
@@ -503,23 +503,18 @@ class Phenotyper(object):
             if name == 'color_histograms':
                 logging.info("- Running color:histograms...")
                 data = self.__get_color_histograms(self.img, args, self.bin_mask)
-
             elif name == 'color_bgr_means':
                 logging.info("- Running color:bgr_means...")
                 data = self.__get_color_bgr_means(self.img, args, self.bin_mask)
-
             elif name == 'shape_outline':
                 logging.info("- Running shape:outline...")
                 data = self.__get_shape_outline(args, self.bin_mask)
-
             elif name == 'shape_360':
                 logging.info("- Running shape:360...")
                 data = self.__get_shape_360(args, self.bin_mask)
-
             elif name == 'surf':
                 logging.info("- Running feature:surf...")
                 data = self.__get_surf_features(args, self.img)
-
             else:
                 raise ValueError("Unknown feature `%s`" % name)
             phenotype.extend(data)
@@ -665,6 +660,7 @@ class Phenotyper(object):
         if not 0 <= rotation <= 179:
             raise ValueError("Rotation must be in the range 0 to 179, "\
                 "found %s" % rotation)
+
         return contour, rotation
 
     def __shape360_output_per_angle(self, step, output_functions, center, img_masked):
@@ -688,6 +684,7 @@ class Phenotyper(object):
 
         means = means.astype(float)
         sds = sds.astype(float)
+
         return means, sds, histograms
 
     def __shape360_output_mean_sd(self, angle, center):
@@ -707,6 +704,7 @@ class Phenotyper(object):
                 sd = np.std(distances, ddof=1, dtype=np.float32)
             else:
                 sd = 0
+
         return mean, sd
 
     def __shape360_output_color_hist(self, angle, center, img_masked, f_args):
@@ -723,6 +721,7 @@ class Phenotyper(object):
 
         # Create histogram from masked + line masked image.
         hists = self.__get_color_histograms(img_masked, f_args, line_mask)
+
         return hists
 
     def __get_surf_features(self, args, src):
@@ -971,71 +970,93 @@ class MakeTrainData(Common):
         configuration `config` or `self.config`.
         """
         session, metadata = db.get_session_or_error()
-
         if not conf.force_overwrite and os.path.isfile(filename):
             raise FileExistsError(filename)
 
         # Get the classification categories from the database.
-        classes = db.get_classes_from_filter(session, metadata, filter_)
-        assert len(classes) > 0, \
-            "No classes found for filter `%s`" % filter_
-
-        # Get the photos and corresponding classification using the filter.
-        images = db.get_filtered_photos_with_taxon(session, metadata, filter_)
-        images = images.all()
-
-        if not images:
-            logging.info("No images found for the filter `%s`", filter_)
+        classes, images, go_back = self.__export_get_images(session, metadata, filter_)
+        if go_back:
             return
-
-        if self.get_photo_count_min():
-            assert len(images) >= self.get_photo_count_min(), \
-                "Expected to find at least photo_count_min={0} photos, found " \
-                "{1}".format(self.get_photo_count_min(), len(images))
 
         # Calculate the number of images that will be processed, taking into
         # account the subset.
         photo_ids = np.array([photo.id for photo, _ in images])
-
         if self.subset:
             n_images = len(np.intersect1d(list(photo_ids), list(self.subset)))
         else:
             n_images = len(images)
-
         logging.info("Going to process %d photos...", n_images)
 
         # Make a codeword for each class.
         codewords = get_codewords(classes)
 
-        # Get the configurations.
+        # Get the configurations and load the fingerprint cache.
         if not config:
             config = self.config
-
-        # Load the fingerprint cache.
         self.cache.load_cache(self.cache_path, config)
 
         # Check if the BagOfWords alogrithm needs to be applied.
-        use_bow = False
-        for name in sorted(vars(self.config.features).keys()):
-            if name == 'surf':
-                use_bow = True
-        if use_bow and codebook_file == None:
-            codebook = self.__make_codebook(images, filename)
-        elif use_bow:
-            with open(codebook_file, "rb") as cb:
-                codebook = load(cb)
+        use_bow, n_clusters, codebook = self.__export_check_bow(images, 
+                                                filename, codebook_file)
 
-        # Construct the header.
-        if use_bow:
+        # Generate training data.
+        self.__export_generate_training_data(classes, n_clusters, filename, images,
+                                             codebook, codewords, use_bow)
+
+        logging.info("Training data written to %s", filename)
+
+    def __export_get_images(self, session, metadata, filter_):
+        """Get the photos and corresponding classification using the filter.
+
+        Method is called from 'export'. If no images were found, a return 
+        command has to be executed in 'export'. Therefore a True or False
+        is returned with the classes and images."""
+
+        classes = db.get_classes_from_filter(session, metadata, filter_)
+        assert len(classes) > 0, "No classes found for filter `%s`" % filter_
+
+        images = db.get_filtered_photos_with_taxon(session, metadata, filter_)
+        images = images.all()
+        if not images:
+            logging.info("No images found for the filter `%s`", filter_)
+            return classes, images, True
+        if self.get_photo_count_min():
+            assert len(images) >= self.get_photo_count_min(), \
+                "Expected to find at least photo_count_min={0} photos, found " \
+                "{1}".format(self.get_photo_count_min(), len(images))
+
+        return classes, images, False
+
+    def __export_check_bow(self, images, filename, codebook_file=None):
+        """Check if the BOW-algorithm needs to be applied."""
+
+        if 'surf' in sorted(vars(self.config.features).keys()):
+            use_bow = True
+            if codebook_file:
+                with open(codebook_file, "rb") as cb:
+                    codebook = load(cb)
+            else:
+                codebook = self.__make_codebook(images, filename)               
             n_clusters = len(codebook)
         else:
+            use_bow = False
             n_clusters = None
+            codebook = None
+            print("\n\nGEEN SURF GEVONDEN!")
+            print(sorted(vars(self.config.features).keys()))
+            print("\n\n")
+
+        return use_bow, n_clusters, codebook
+
+    def __export_generate_training_data(self, classes, n_clusters, filename,
+                                        images, codebook, codewords, use_bow):
+        """Generate training data for method 'export'."""
+        # Construct the header.
         header_data, header_out = self.__make_header(len(classes), n_clusters)
         header = ["ID"] + header_data + header_out
 
         # Generate the training data.
         with open(filename, 'w') as fh:
-            # Write the header.
             fh.write( "%s\n" % "\t".join(header) )
 
             # Set the training data.
@@ -1049,38 +1070,8 @@ class MakeTrainData(Common):
                 logging.info("Processing `%s` of class `%s`...",
                     photo.path, class_)
 
-                # Get phenotype for this image from the cache.
-                phenotype = self.cache.get_phenotype(photo.md5sum)
-
-                # If the BagOfWords algorithm is applied,
-                # convert phenotype of SURF features to BOW-code.
-                if use_bow:
-                    surf_feat = []
-                    bgr_feat = []
-                    surf_locations = []
-                    bgr_locations = []
-                    for featnr in range(len(phenotype)):
-                        # Check if phenotype is created with SURF or BGR.
-                        if phenotype[featnr].shape == (128,):
-                            surf_locations.append(featnr)
-                            surf_feat.append(phenotype[featnr])
-                        else:
-                            bgr_locations.append(featnr)
-                            bgr_feat.append(phenotype[featnr])
-
-                    bowcode = get_bowcode_from_surf_features(surf_feat,
-                                                               codebook)
-                    if 0 in bgr_locations:
-                        phenotype = list(bgr_feat)
-                        phenotype.extend(bowcode)
-                    else:
-                        phenotype = list(bowcode)
-                        phenotype.extend(bgr_feat)
-
-                assert len(phenotype) == len(header_data), \
-                    "Fingerprint size mismatch. According to the header " \
-                    "there are {0} data columns, but the fingerprint has " \
-                    "{1}".format(len(header_data), len(phenotype))
+                phenotype = self.__export_get_training_phenotype(photo, 
+                    codebook, header_data)
 
                 training_data.append(phenotype, codewords[class_],
                     label=photo.id)
@@ -1101,7 +1092,22 @@ class MakeTrainData(Common):
                 row.extend(output.astype(str))
                 fh.write("%s\n" % "\t".join(row))
 
-        logging.info("Training data written to %s", filename)
+    def __export_get_training_phenotype(self, photo, codebook, header_data):
+        """Return the phenotype for 'photo'."""
+
+        # Get phenotype for this image from the cache.
+        phenotype = self.cache.get_phenotype(photo.md5sum)
+
+        # If the BagOfWords algorithm is applied,
+        # convert phenotype of SURF features to BOW-code.
+        phenotype = get_phenotype_with_bowcode(phenotype, codebook)
+
+        assert len(phenotype) == len(header_data), \
+            "Fingerprint size mismatch. According to the header " \
+            "there are {0} data columns, but the fingerprint has " \
+            "{1}".format(len(header_data), len(phenotype))
+
+        return phenotype
 
     def __make_header(self, n_out, n_clusters):
         """Construct a header from features settings.
