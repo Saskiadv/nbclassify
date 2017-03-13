@@ -978,13 +978,7 @@ class MakeTrainData(Common):
         if go_back:
             return
 
-        # Calculate the number of images that will be processed, taking into
-        # account the subset.
-        photo_ids = np.array([photo.id for photo, _ in images])
-        if self.subset:
-            n_images = len(np.intersect1d(list(photo_ids), list(self.subset)))
-        else:
-            n_images = len(images)
+        photo_ids, n_images = self.__export_get_photo_ids(images)
         logging.info("Going to process %d photos...", n_images)
 
         # Make a codeword for each class.
@@ -997,11 +991,11 @@ class MakeTrainData(Common):
 
         # Check if the BagOfWords alogrithm needs to be applied.
         use_bow, n_clusters, codebook = self.__export_check_bow(images, 
-                                                filename, codebook_file)
+            filename, codebook_file)
 
         # Generate training data.
-        self.__export_generate_training_data(classes, n_clusters, filename, images,
-                                             codebook, codewords, use_bow)
+        self.__export_generate_training_data(classes, n_clusters, filename,
+            images, codebook, codewords, use_bow)
 
         logging.info("Training data written to %s", filename)
 
@@ -1026,6 +1020,17 @@ class MakeTrainData(Common):
                 "{1}".format(self.get_photo_count_min(), len(images))
 
         return classes, images, False
+
+    def __export_get_photo_ids(self, images):
+        """Return the number of images that will be processed, taking into
+           account the subset."""
+        photo_ids = np.array([photo.id for photo, _ in images])
+        if self.subset:
+            n_images = len(np.intersect1d(list(photo_ids), list(self.subset)))
+        else:
+            n_images = len(images)
+
+        return photo_ids, n_images
 
     def __export_check_bow(self, images, filename, codebook_file=None):
         """Check if the BOW-algorithm needs to be applied."""
@@ -1061,21 +1066,8 @@ class MakeTrainData(Common):
 
             # Set the training data.
             training_data = TrainData(len(header_data), len(classes))
-
-            for photo, class_ in images:
-                # Only export the subset if an export subset is set.
-                if self.subset and photo.id not in self.subset:
-                    continue
-
-                logging.info("Processing `%s` of class `%s`...",
-                    photo.path, class_)
-
-                phenotype = self.__export_get_training_phenotype(photo, 
-                    codebook, header_data)
-
-                training_data.append(phenotype, codewords[class_],
-                    label=photo.id)
-
+            training_data = self.__export_process_images(images, codebook, 
+                header_data, training_data, codewords)
             training_data.finalize()
 
             if not training_data:
@@ -1092,22 +1084,31 @@ class MakeTrainData(Common):
                 row.extend(output.astype(str))
                 fh.write("%s\n" % "\t".join(row))
 
-    def __export_get_training_phenotype(self, photo, codebook, header_data):
-        """Return the phenotype for 'photo'."""
+    def __export_process_images(self, images, codebook, header_data, training_data, 
+                                codewords):
+        """Add phenotype to 'training_data' for every desired photo."""
+        for photo, class_ in images:
+            # Only export the subset if an export subset is set.
+            if self.subset and photo.id not in self.subset:
+                continue
 
-        # Get phenotype for this image from the cache.
-        phenotype = self.cache.get_phenotype(photo.md5sum)
+            logging.info("Processing `%s` of class `%s`...", photo.path, class_)
 
-        # If the BagOfWords algorithm is applied,
-        # convert phenotype of SURF features to BOW-code.
-        phenotype = get_phenotype_with_bowcode(phenotype, codebook)
+            # Get phenotype for this image from the cache.
+            phenotype = self.cache.get_phenotype(photo.md5sum)
 
-        assert len(phenotype) == len(header_data), \
-            "Fingerprint size mismatch. According to the header " \
-            "there are {0} data columns, but the fingerprint has " \
-            "{1}".format(len(header_data), len(phenotype))
+            # If the BagOfWords algorithm is applied,
+            # convert phenotype of SURF features to BOW-code.
+            phenotype = get_phenotype_with_bowcode(phenotype, codebook)
 
-        return phenotype
+            assert len(phenotype) == len(header_data), \
+                "Fingerprint size mismatch. According to the header " \
+                "there are {0} data columns, but the fingerprint has " \
+                "{1}".format(len(header_data), len(phenotype))
+
+            training_data.append(phenotype, codewords[class_], label=photo.id)
+
+        return training_data
 
     def __make_header(self, n_out, n_clusters):
         """Construct a header from features settings.
@@ -1116,7 +1117,6 @@ class MakeTrainData(Common):
         """
         if 'features' not in self.config:
             raise ConfigurationError("missing `features`")
-
         data = []
         out = []
 
@@ -1126,60 +1126,99 @@ class MakeTrainData(Common):
 
         for feature in features:
             args = self.config.features[feature]
-
-            if feature == 'color_histograms':
-                for colorspace, bins in vars(args).iteritems():
-                    for ch, n in enumerate(bins):
-                        for i in range(1, n+1):
-                            data.append("%s:%d" % (colorspace[ch], i))
-
-            if feature == 'color_bgr_means':
-                bins = getattr(args, 'bins', 20)
-                for i in range(1, bins+1):
-                    for axis in ("HOR", "VER"):
-                        for ch in "BGR":
-                            data.append("BGR_MN:%d.%s.%s" % (i,axis,ch))
-
-            if feature == 'shape_outline':
-                n = getattr(args, 'k', 15)
-                for i in range(1, n+1):
-                    data.append("OUTLINE:%d.X" % i)
-                    data.append("OUTLINE:%d.Y" % i)
-
-            if feature == 'shape_360':
-                step = getattr(args, 'step', 1)
-                output_functions = getattr(args, 'output_functions', {'mean_sd': 1})
-                for f_name, f_args in vars(output_functions).iteritems():
-                    if f_name == 'mean_sd':
-                        for i in range(0, 360, step):
-                            data.append("360:%d.MN" % i)
-                            data.append("360:%d.SD" % i)
-
-                    if f_name == 'color_histograms':
-                        for i in range(0, 360, step):
-                            for cs, bins in vars(f_args).iteritems():
-                                for j, color in enumerate(cs):
-                                    for k in range(1, bins[j]+1):
-                                        data.append("360:%d.%s:%d" % (i,color,k))
-
-            if feature == 'surf':
+            if feature in ['color_histograms', 'color_bgr_means']:
+                data = self.__make_header_feature_color(feature, args, data)
+            elif feature in ['shape_outline', 'shape_360']:
+                data = self.__make_header_feature_shape(feature, args, data)
+            elif feature == 'surf':
                 for i in range(1, n_clusters+1):
                     data.append("CL%d" % i)
-
 
         # Write classification columns.
         try:
             out_prefix = self.config.data.dependent_prefix
         except:
             out_prefix = OUTPUT_PREFIX
-
         for i in range(1, n_out + 1):
             out.append("%s%d" % (out_prefix, i))
 
         return (data, out)
 
+    def __make_header_feature_color(self, feature, args, data):
+        """Append data for color related features."""
+        if feature == 'color_histograms':
+            for colorspace, bins in vars(args).iteritems():
+                for ch, n in enumerate(bins):
+                    for i in range(1, n+1):
+                        data.append("%s:%d" % (colorspace[ch], i))
+        elif feature == 'color_bgr_means':
+            bins = getattr(args, 'bins', 20)
+            for i in range(1, bins+1):
+                for axis in ("HOR", "VER"):
+                    for ch in "BGR":
+                        data.append("BGR_MN:%d.%s.%s" % (i,axis,ch))
+
+        return data
+
+    def __make_header_feature_shape(self, feature, args, data):
+        """Append data for shape related features."""
+        if feature == 'shape_outline':
+            n = getattr(args, 'k', 15)
+            for i in range(1, n+1):
+                data.append("OUTLINE:%d.X" % i)
+                data.append("OUTLINE:%d.Y" % i)
+        elif feature == 'shape_360':
+            step = getattr(args, 'step', 1)
+            output_functions = getattr(args, 'output_functions', {'mean_sd': 1})
+            for f_name, f_args in vars(output_functions).iteritems():
+                if f_name == 'mean_sd':
+                    for i in range(0, 360, step):
+                        data.append("360:%d.MN" % i)
+                        data.append("360:%d.SD" % i)
+                elif f_name == 'color_histograms':
+                    for i in range(0, 360, step):
+                        for cs, bins in vars(f_args).iteritems():
+                            for j, color in enumerate(cs):
+                                for k in range(1, bins[j]+1):
+                                    data.append("360:%d.%s:%d" % (i,color,k))
+
+        return data
+
+
     def __make_codebook(self, images, filename):
+        """Make a codebook of the SURF features."""
         # Create nparray with all descriptors of the SURF features.
+        descr_array = self.__make_codebook_get_descriptors(images)
+
+        # Get number of clusters.
+        n_clusters = self.__make_codebook_get_nclusters(descr_array)
+
+        logging.info("%d extracted features will now be clustered into "
+                     "%d clusters to create a codebook (this will take "
+                     "a while)...", descr_array.shape[0], n_clusters)        
+        tries = 1
+        start, end, codebook = self.__create_codebook(descr_array, 
+            n_clusters, tries)
+
+        # Check if the length of the codebook is correct.
+        start, end, codebook = self.__check_codebook_length(
+            codebook, n_clusters, tries, start, end, descr_array)
+        
+        time = end - start
+        logging.info("\nThe codebook was succesfully created! It took %s "
+                     "(H:M:S)\n", time)
+
+        # Save the codebook.
+        codebookfilename = filename + "_codebook.file"
+        with open(codebookfilename, "wb") as f:
+            dump(codebook, f, protocol=HIGHEST_PROTOCOL)
+
+        logging.info("Codebook created and saved to %s", codebookfilename)
+
+        return codebook
+
+    def __make_codebook_get_descriptors(self, images):
+        """Return nparray with all descriptors of the SURF features."""
         descr_array = np.zeros((len(images) * 1000, 128))
         position = 0
         for photo, class_ in images:
@@ -1208,7 +1247,10 @@ class MakeTrainData(Common):
         # Adjust size of nparray to number of descriptors.
         descr_array = np.resize(descr_array, (position, 128))
 
-        # Get number of clusters.
+        return descr_array
+
+    def __make_codebook_get_nclusters(self, descr_array):
+        """Return number of clusters to create codebook with."""
         bow_clusters = getattr(self.config.features['surf'], 'bow_clusters', None)
         if str(bow_clusters).isdigit():
             n_clusters = int(bow_clusters)
@@ -1220,41 +1262,50 @@ class MakeTrainData(Common):
                             "number of features will be used.")
             n_clusters = int(np.sqrt(descr_array.shape[0]))
 
-        logging.info("%d extracted features will now be clustered into "
-                     "%d clusters to create a codebook (this will take "
-                     "a while)...", descr_array.shape[0], 
-                     n_clusters)
-                     
+        return n_clusters
+
+    def __create_codebook(self, descr_array, n_clusters, tries):
+        """Create a codebook of SURF features with the k-means method.
+
+        Cluster the SURF features in 'descr_array' into 'n_clusters'
+        with the k-means method. Return the codebook, start and 
+        end time."""
         start = datetime.datetime.now().replace(microsecond=0)
-        logging.info("\nStart creating codebook at: %s\n", start)
+
+        if tries == 1:
+            logging.info("\nStart creating codebook at: %s\n", start)
+        elif tries == 2:
+            logging.info("\nStart creating codebook for %dnd time at: %s\n",
+                         tries, start)
+        elif tries > 2:
+            logging.info("\nStart creating codebook for %dth time at: %s\n",
+                         tries, start)
+
         codebook, _distortion = vq.kmeans(descr_array, n_clusters)
         end = datetime.datetime.now().replace(microsecond=0)
         
-        # Check if the length of the codebook is correct.
+        return start, end, codebook
+
+    def __check_codebook_length(self, codebook, n_clusters, tries, start, end,
+                                descr_array):
+        """Check if the codebook has the correct number of clusters.
+
+        When in the k-means method a cluster has no datapoints,
+        it won't end up in the codebook and the codebook will have 
+        a length that is not the same as the expected number of clusters.
+        The codebook than has to be recreated until the right number of 
+        clusters is made."""
         while len(codebook) != n_clusters:
+            tries += 1
             time = end - start
-            logging.warning("%d clusters were created in stead of %d. "
-                            "The codebook must be created again. This "
-                            "will probably take the same time as last "
-                            "time: %s (H:M:S), starting at %s", 
-                            len(codebook), n_clusters, time,
-                            datetime.datetime.now().replace(microsecond=0))
-            start = datetime.datetime.now().replace(microsecond=0)
-            codebook, _distortion = vq.kmeans(descr_array, n_clusters)
-            end = datetime.datetime.now().replace(microsecond=0)
-        
-        time = end - start
-        logging.info("\nThe codebook was succesfully created! It took %s "
-                     "(H:M:S)\n", time)
+            logging.warning("%d clusters were created in stead of %d. The "
+                            "codebook must be created again. This will "
+                            "probably take the same time as last time: "
+                            "%s (H:M:S)", len(codebook), n_clusters, time)
+            start, end, codebook = self._create_codebook(descr_array, 
+                n_clusters, tries)
 
-        # Save the codebook.
-        codebookfilename = filename + "_codebook.file"
-        with open(codebookfilename, "wb") as f:
-            dump(codebook, f, protocol=HIGHEST_PROTOCOL)
-
-        logging.info("Codebook created and saved to %s", codebookfilename)
-
-        return codebook
+        return start, end, codebook
 
 
 class BatchMakeTrainData(MakeTrainData):
