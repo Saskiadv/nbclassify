@@ -184,7 +184,6 @@ class PhenotypeCache(object):
 
         return cache, phenotyper
 
-
     def load_cache(self, cache_dir, config):
         """Load cache for a feature extraction configuration.
 
@@ -386,7 +385,8 @@ class Phenotyper(object):
 
         Scale the image down if its perimeter (width+height) exceeds the
         maximum. If a ROI is set, use the perimeter of the ROI instead, or
-        else we might end up with a very small ROI."""
+        else we might end up with a very small ROI.
+        """
         if self.roi:
             perim = sum(self.roi[2:4])
         else:
@@ -451,7 +451,8 @@ class Phenotyper(object):
         """Crop image to desired region of interest (ROI).
  
         A ROI can be described in pixel units or in fractions of total image
-        size. If no (valid) ROI is described, the whole image will be used."""
+        size. If no (valid) ROI is described, the whole image will be used.
+        """
         roi_pix = getattr(crop, 'roi_pix', None)
         roi_frac = getattr(crop, 'roi_frac', None)
         if roi_pix:
@@ -511,6 +512,12 @@ class Phenotyper(object):
         logging.info("Extracting features...")
 
         # Construct the phenotype.
+        phenotype = self.make_phenotype()
+
+        return phenotype
+
+    def make_phenotype(self):
+        """Construct and return the phenotype."""
         phenotype = []
         for name in sorted(vars(self.config.features).keys()):
             args = self.config.features[name]
@@ -765,7 +772,6 @@ class Phenotyper(object):
 
             return des
 
-
 class TrainData(object):
 
     """Store and retrieve training data.
@@ -1011,7 +1017,6 @@ class MakeTrainData(Common):
         # Generate training data.
         self.__export_generate_training_data(classes, n_clusters, filename,
             images, codebook, codewords, use_bow)
-
         logging.info("Training data written to %s", filename)
 
     def __export_get_images(self, session, metadata, filter_):
@@ -1019,8 +1024,8 @@ class MakeTrainData(Common):
 
         Method is called from 'export'. If no images were found, a return 
         command has to be executed in 'export'. Therefore a True or False
-        is returned with the classes and images."""
-
+        is returned with the classes and images.
+        """
         classes = db.get_classes_from_filter(session, metadata, filter_)
         assert len(classes) > 0, "No classes found for filter `%s`" % filter_
 
@@ -1049,7 +1054,6 @@ class MakeTrainData(Common):
 
     def __export_check_bow(self, images, filename, codebook_file=None):
         """Check if the BOW-algorithm needs to be applied."""
-
         if 'surf' in sorted(vars(self.config.features).keys()):
             use_bow = True
             if codebook_file:
@@ -1199,7 +1203,6 @@ class MakeTrainData(Common):
 
         return data
 
-
     def __make_codebook(self, images, filename):
         """Make a codebook of the SURF features."""
         # Create nparray with all descriptors of the SURF features.
@@ -1284,7 +1287,8 @@ class MakeTrainData(Common):
 
         Cluster the SURF features in 'descr_array' into 'n_clusters'
         with the k-means method. Return the codebook, start and 
-        end time."""
+        end time.
+        """
         start = datetime.datetime.now().replace(microsecond=0)
 
         if tries == 1:
@@ -1309,7 +1313,8 @@ class MakeTrainData(Common):
         it won't end up in the codebook and the codebook will have 
         a length that is not the same as the expected number of clusters.
         The codebook than has to be recreated until the right number of 
-        clusters is made."""
+        clusters is made.
+        """
         while len(codebook) != n_clusters:
             tries += 1
             time = end - start
@@ -1321,7 +1326,6 @@ class MakeTrainData(Common):
                 n_clusters, tries)
 
         return start, end, codebook
-
 
 class BatchMakeTrainData(MakeTrainData):
 
