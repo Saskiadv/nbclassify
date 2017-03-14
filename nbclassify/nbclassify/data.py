@@ -69,23 +69,32 @@ class PhenotypeCache(object):
                 raise ConfigurationError("features not set")
 
             for name, feature in vars(features).iteritems():
-                # Construct a new configuration object with a single feature
-                # which can be passed to Phenotyper. We want to store only one
-                # feature per cache file.
-                c = deepcopy(c)
-                c.features = Struct({name: feature})
-
-                # Get those configuration objects that are suitable for creating
-                # hashes for the feature caches.
-                hashables = get_config_hashables(c)
-
-                # Create a hash from the configurations. The hash must be
-                # different for different configurations.
-                hash_ = combined_hash(feature, *hashables)
+                hash_, c = self.get_hash_(c, name, feature)
 
                 if hash_ not in seen_hashes:
                     seen_hashes.append(hash_)
                     yield (hash_, c)
+
+    def get_hash_(self, c, name, feature):
+        """Return the hash of a feature.
+
+        Method is called from 'get_single_feature_configurations'.
+        """
+        # Construct a new configuration object with a single feature which 
+        # can be passed to Phenotyper. We want to store only one
+        # feature per cache file.
+        c = deepcopy(c)
+        c.features = Struct({name: feature})
+
+        # Get those configuration objects that are suitable for creating
+        # hashes for the feature caches.
+        hashables = get_config_hashables(c)
+
+        # Create a hash from the configurations. The hash must be
+        # different for different configurations.
+        hash_ = combined_hash(feature, *hashables)
+
+        return hash_, c
 
     def get_cache(self):
         """Return the cache as a nested dictionary.
@@ -144,7 +153,6 @@ class PhenotypeCache(object):
         for hash_, c in self.get_single_feature_configurations(config):
             if not os.path.isdir(cache_dir):
                 os.makedirs(cache_dir)
-
             cache_path = os.path.join(cache_dir, str(hash_))
             sys.stderr.write("Caching features in `%s`...\n" % cache_path)
 
@@ -155,20 +163,27 @@ class PhenotypeCache(object):
             phenotyper.set_config(c)
 
             # Cache the feature for each photo.
-            for photo in photos:
-                # Skip feature extraction if the feature already exists, unless
-                # update is set to True.
-                if not update and str(photo.md5sum) in cache:
-                    continue
-
-                logging.info("Processing photo %s...", photo.id)
-                
-                # Extract a feature and cache it.
-                im_path = os.path.join(image_dir, photo.path)
-                phenotyper.set_image(im_path)
-                cache[str(photo.md5sum)] = phenotyper.make()
-
+            cache, phenotyper = self.make_cache(photos, update, cache, 
+                image_dir, phenotyper)
             cache.close()
+
+    def make_cache(self, photos, update, cache, image_dir, phenotyper):
+        """Cache the features for each photo."""
+        for photo in photos:
+            # Skip feature extraction if the feature already exists, unless
+            # update is set to True.
+            if not update and str(photo.md5sum) in cache:
+                continue
+
+            logging.info("Processing photo %s...", photo.id)
+                
+            # Extract a feature and cache it.
+            im_path = os.path.join(image_dir, photo.path)
+            phenotyper.set_image(im_path)
+            cache[str(photo.md5sum)] = phenotyper.make()
+
+        return cache, phenotyper
+
 
     def load_cache(self, cache_dir, config):
         """Load cache for a feature extraction configuration.
