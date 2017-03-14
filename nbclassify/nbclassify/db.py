@@ -24,7 +24,8 @@ from sqlalchemy.sql import functions
 
 from . import conf
 from .exceptions import *
-from .functions import Struct, get_childs_from_hierarchy, path_from_filter
+from .functions import Struct, get_childs_from_hierarchy, path_from_filter, \
+    check_if_file_exists
 
 
 def get_classes_from_filter(session, metadata, filter_):
@@ -77,6 +78,12 @@ def get_filtered_photos_with_taxon(session, metadata, filter_):
         join(stmt_species, stmt_species.c.id == Photo.id)
 
     # Filter on each taxon in the where attribute of the filter.
+    q = filter_query(filter_, q, stmt_genus, stmt_section, stmt_species)
+
+    return q
+
+def filter_query(filter_, q, stmt_genus, stmt_section, stmt_species):
+    """Filter on each taxon in the where attribute of the filter."""
     where = filter_.get('where', {})
     for rank_name, taxon_name in where.items():
         if rank_name == 'genus':
@@ -95,6 +102,7 @@ def get_photos(session, metadata):
     configure_mappers()
     Photo = Base.classes.photos
     photos = session.query(Photo)
+
     return photos
 
 def get_photos_with_taxa(session, metadata):
@@ -179,6 +187,7 @@ def get_taxon_hierarchy(session, metadata):
         if section not in hierarchy[genus]:
             hierarchy[genus][section] = []
         hierarchy[genus][section].append(species)
+
     return hierarchy
 
 def insert_new_photo(session, metadata, root, path, update=False, **kwargs):
@@ -203,10 +212,36 @@ def insert_new_photo(session, metadata, root, path, update=False, **kwargs):
     integer.
     """
     real_path = os.path.join(root, path)
-    if not os.path.isfile(real_path):
-        raise IOError("Cannot open %s (no such file)" % real_path)
+    check_if_file_exists(real_path)
 
-    # Get meta data from the arguments.
+    # Get meta data from the arguments, the database models and MD5 hash.
+    photo_id, title, description, taxa, tags = get_meta_data_from_args(kwargs)
+    Base, Photo, Rank, Taxon, Tag = get_db_models(metadata)
+    hasher = get_hasher(real_path)
+
+    # Check if a photo with the same MD5 sum or ID exists in the database.
+    check_md5sum_existence(session, Photo, hasher, update)
+    check_ID_existence(photo_id, session, Photo, update)
+
+    # Insert the photo into the database.
+    photo = add_photo(Photo, hasher, path, title, description)
+
+    # Overwrite the ID if the photo ID was provided.
+    if photo_id:
+        photo.id = photo_id
+
+    # Save photo's taxa to the database.
+    processed_ranks, photo = save_taxa(taxa, session, Rank, Taxon, photo)
+
+    # Make sure that the required ranks are set for each photo and 
+    # set the tags for this photo.
+    photo = set_tags(processed_ranks, tags, session, Tag, photo)
+
+    # Add photo to session.
+    session.add(photo)
+
+def get_meta_data_from_args(kwargs):
+    """Return metadata from arguments."""
     photo_id = None
     title = None
     description = None
@@ -228,8 +263,11 @@ def insert_new_photo(session, metadata, root, path, update=False, **kwargs):
             tags = list(val)
         else:
             ValueError("Unknown keyword argument `%s`" % key)
-    
-    # Get the database models.
+
+    return photo_id, title, description, taxa, tags
+
+def get_db_models(metadata):
+    """Return the database models."""
     Base = automap_base(metadata=metadata)
     Base.prepare()
     configure_mappers()
@@ -239,13 +277,19 @@ def insert_new_photo(session, metadata, root, path, update=False, **kwargs):
     Taxon = Base.classes.taxa
     Tag = Base.classes.tags
 
-    # Get the MD5 hash.
+    return Base, Photo, Rank, Taxon, Tag
+
+def get_hasher(real_path):
+    """Return the MD5 hash."""
     hasher = hashlib.md5()
     with open(real_path, 'rb') as fh:
         buf = fh.read()
         hasher.update(buf)
 
-    # Check if a photo with the same MD5 sum exists in the database.
+    return hasher
+
+def check_md5sum_existence(session, Photo, hasher, update):
+    """Check if a photo with the same MD5 sum exists in the database."""
     try:
         photo = session.query(Photo).\
             filter(Photo.md5sum == hasher.hexdigest()).one()
@@ -259,7 +303,8 @@ def insert_new_photo(session, metadata, root, path, update=False, **kwargs):
         else:
             session.delete(photo)
 
-    # Check if a photo with the same ID exists in the database.
+def check_ID_existence(photo_id, session, Photo, update):
+    """Check if a photo with the same ID exists in the database."""
     if photo_id:
         try:
             photo = session.query(Photo).\
@@ -274,26 +319,24 @@ def insert_new_photo(session, metadata, root, path, update=False, **kwargs):
             else:
                 session.delete(photo)
 
-    # Insert the photo into the database.
+def add_photo(Photo, hasher, path, title, description):
+    """Add photo to database."""
     photo = Photo(
-        md5sum=hasher.hexdigest(),
-        path=path,
-        title=title,
+        md5sum=hasher.hexdigest(), 
+        path=path, 
+        title=title, 
         description=description
     )
 
-    # Overwrite the ID if the photo ID was provided.
-    if photo_id:
-        photo.id = photo_id
+    return photo
 
-    # Save photo's taxa to the database.
+def save_taxa(taxa, session, Rank, Taxon, photo):
+    """Save photo's taxa to the database."""
     processed_ranks = []
     for rank_name, taxon_name in taxa.items():
-        # Skip ranks that evaluate to False.
+        # Skip ranks that evaluate to False or don't have a taxon set.
         if not rank_name:
             continue
-
-        # Skip if the taxon is not set.
         if not taxon_name:
             continue
 
@@ -312,13 +355,15 @@ def insert_new_photo(session, metadata, root, path, update=False, **kwargs):
         except NoResultFound:
             taxon = Taxon(name=taxon_name, ranks=rank)
 
-        # Add this taxon to the photo.
+        # Add this taxon to the photo and keep track of processed ranks.
         photo.taxa_collection.append(taxon)
-
-        # Keep track of processed ranks.
         processed_ranks.append(rank.name)
 
-    # Make sure that the required ranks are set for each photo.
+    return processed_ranks, photo
+
+def set_tags(processed_ranks, tags, session, Tag, photo):
+    """Check required ranks and set tags for the photo."""
+    # Make sure the required ranks are set for the photo.
     if conf.required_ranks:
         assert set(conf.required_ranks).issubset(processed_ranks), \
             "Every photo must at least have the ranks {0}".\
@@ -339,8 +384,7 @@ def insert_new_photo(session, metadata, root, path, update=False, **kwargs):
         # Add this tag to the photo.
         photo.tags_collection.append(tag)
 
-    # Add photo to session.
-    session.add(photo)
+    return photo
 
 def make_meta_db(db_path):
     """Create a new metadata SQLite database `db_path`.
